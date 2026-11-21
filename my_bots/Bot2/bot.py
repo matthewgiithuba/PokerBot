@@ -13,10 +13,18 @@ STATS = {
 def opstats(gs):
     me = gs["your_bot_id"]
     cur = gs["hand_num"]
+    old = STATS["last_done"]
+
+    new_hands = (cur - 1) - old
+    if new_hands > 0:
+        f = 0.99 ** new_hands
+        for k in ("faced", "folds", "acts", "raises"):
+            STATS[k] *= f
+
     pending = None
     for e in gs["match_action_log"]:
         h = e["hand_num"]
-        if h <= STATS["last_done"] or h >= cur:      # only completed, not-yet-counted hands
+        if h <= STATS["last_done"] or h >= cur:
             continue
         a = e["action"]
         if a in ("small_blind", "big_blind", "ante", "show"):
@@ -97,7 +105,7 @@ def opp_cutoff(gs, aggr):
     cutoff -= 0.20 * (aggr - 0.25)                   # aggressive players bet weaker hands
     return max(0.0, min(cutoff, 0.62))
 
-def monte(game_state,cutoff, budget=0.4):
+def monte(game_state, cutoff, aggr=0.25, budget=0.4, target=1500):
     if game_state["street"] == "preflop":
         return 0
     hero = [eval7.Card(c) for c in game_state["your_cards"]]
@@ -105,17 +113,21 @@ def monte(game_state,cutoff, budget=0.4):
     known = set(game_state["your_cards"] + game_state["community_cards"])
     remaining = [c for c in eval7.Deck().cards if str(c) not in known]
     need = 5 - len(board)
+    late = game_state["street"] in ("turn", "river")
 
     win = tie = total = 0
     end_time = time.perf_counter() + budget
-    while time.perf_counter() < end_time:
+    while total < target and time.perf_counter() < end_time:
         drawn = random.sample(remaining, 2 + need)
         opp = drawn[:2]
         if cutoff and preflop_equity([str(opp[0]), str(opp[1])]) < cutoff:
-            continue                                   # skip hands they wouldn't bet with
+            continue
         full_board = board + drawn[2:]
         mine = eval7.evaluate(hero + full_board)
         theirs = eval7.evaluate(opp + full_board)
+        # passive players betting late usually have a pair or better
+        if cutoff and late and aggr < 0.30 and eval7.handtype(theirs) == "High Card":
+            continue
         if mine > theirs:
             win += 1
         elif mine == theirs:
@@ -160,15 +172,15 @@ def decide(game_state: dict) -> dict:
 
     if preflop:
         equity = preflop_equity(game_state["your_cards"])
-        # FIX 1: only discount hands that lose value against a raiser (replaces the old `if` line)
         if game_state["current_bet"] > bb and equity < 0.75:
             equity -= 0.04 + 0.05 * min(owed / max(pot - owed, 1), 2.0)
     else:
-        equity = monte(game_state, opp_cutoff(game_state, aggr))
+        # CHANGE (#4, #6): pass aggr, and size the time budget from the deadline
+        budget = min(0.4, game_state.get("time_limit_ms", 2000) / 1000 * 0.2)
+        equity = monte(game_state, opp_cutoff(game_state, aggr), aggr, budget)
 
     bet_size = owed / max(pot - owed, 1)
 
-    # FIX 3: short-stack shove-or-fold (needs equity and can_check, so it goes after them)
     if mychips < 10 * bb and not can_check:
         return {"action": "all_in"} if equity > 0.52 else {"action": "fold"}
 
@@ -179,7 +191,8 @@ def decide(game_state: dict) -> dict:
     value_thr = 0.62 - 0.05 * exploit
     open_thr = 0.44 - 0.06 * exploit
 
-    if preflop and on_button and game_state["current_bet"] <= bb and equity > open_thr:
+    # CHANGE (#3): added `and equity < 0.80` so AA/KK fall through to the bigger value bet
+    if preflop and on_button and game_state["current_bet"] <= bb and open_thr < equity < 0.80:
         return bet_to(game_state, 0.6)
 
     if not preflop and equity > 0.97:
@@ -190,14 +203,14 @@ def decide(game_state: dict) -> dict:
         return bet_to(game_state, 0.5)
 
     if can_check:
-        if not preflop and equity < 0.45 and random.random() < bluff_freq:
+        # CHANGE (#2): bluff only with true air (0.30), not hands that can win at showdown
+        if not preflop and equity < 0.30 and random.random() < bluff_freq:
             return bet_to(game_state, 0.5)
         return {"action": "check"}
 
     call_amt = min(owed, mychips)
     pot_odds = call_amt / (pot + call_amt)
     margin = 0.05 + 0.10 * min(bet_size, 1.0)
-    # FIX 2: defend wider against small raises so re-raising your opens doesn't print money
     if preflop and owed < 3 * bb:
         margin -= 0.03
     if equity > pot_odds + margin:
