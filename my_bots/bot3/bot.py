@@ -15,6 +15,46 @@ import random
 from bisect import bisect
 from itertools import combinations
 
+
+
+STATS = {"last_done": -1, "faced": 0, "folds": 0, "acts": 0, "raises": 0}
+SKIP = ("small_blind", "big_blind", "ante", "show")
+
+
+def opstats(gs):
+    me, cur, pending = gs["your_bot_id"], gs["hand_num"], None
+    for e in gs["match_action_log"]:
+        h = e["hand_num"]
+        if h <= STATS["last_done"] or h >= cur:   # only finished, not-yet-counted hands
+            continue
+        a = e["action"]
+        if a in SKIP:
+            continue
+        key = (h, e["street"])
+        if e["bot_id"] == me:
+            pending = key if a in ("raise", "all_in") else None
+        else:
+            if pending == key:
+                STATS["faced"] += 1
+                if a == "fold":
+                    STATS["folds"] += 1
+            pending = None
+            STATS["acts"] += 1
+            if a in ("raise", "all_in"):
+                STATS["raises"] += 1
+    STATS["last_done"] = max(STATS["last_done"], cur - 1)
+
+
+def oprates():
+    fold_rate = (STATS["folds"] + 5 * 0.40) / (STATS["faced"] + 5)
+    aggr = (STATS["raises"] + 5 * 0.25) / (STATS["acts"] + 5)
+    return fold_rate, aggr, STATS["faced"], STATS["acts"]
+
+
+
+
+
+
 try:
     import eval7
 except ImportError:  # only used when testing outside the sandbox
@@ -29,7 +69,7 @@ ACTIONS = ["f", "c", "h", "p", "a"]
 FRACS = {"h": 0.5, "p": 1.0}      # raise sizes as a fraction of the pot
 MAX_RAISES = 3                     # raises allowed per street in the abstraction
 EQ_CUTS = [0.35, 0.45, 0.52, 0.58, 0.65, 0.72, 0.82]   # -> 8 hand buckets
-POST_SIMS = 150                    # Monte Carlo samples per postflop decision
+POST_SIMS = 400                   # Monte Carlo samples per postflop decision
 
 
 # ── hand evaluation ─────────────────────────────────────────────────────────
@@ -201,14 +241,21 @@ def _context(gs):
     opp = [p for p in gs["players"] if p.get("bot_id") != gs["your_bot_id"]][0]
     opp_stack, opp_bet = opp["stack"], opp.get("bet_this_street", 0)
     hist = ""
+    cur_bet = 0
     for e in gs.get("action_log", []):
         if e.get("street") != gs["street"]:
             continue
-        a = e.get("action")
-        if a in ("check", "call"):
+        a, amt = e.get("action"), e.get("amount", 0) or 0
+        if a in ("small_blind", "big_blind"):
+            cur_bet = max(cur_bet, amt)
+        elif a in ("check", "call"):
             hist += "c"
         elif a in ("raise", "bet", "all_in"):
-            hist += "r"
+            if amt > cur_bet:
+                hist += "r"
+                cur_bet = amt
+            else:
+                hist += "c"          # all-in that is only a call
     cur = gs["current_bet"]
     owed = gs["amount_owed"]
     pot = gs["pot"]
@@ -236,7 +283,8 @@ def _equity_move(gs, ctx=None, note=""):
         return {"action": "raise", "amount": int(to), "debug": dbg}
     if gs["can_check"]:
         return {"action": "check", "debug": dbg}
-    if eq > owed / (pot + owed) + 0.05:
+    bet_size = owed / max(pot - owed, 1)
+    if eq > owed / (pot + owed) + 0.03 + 0.07 * min(bet_size, 1.0):
         return {"action": "call", "debug": dbg}
     return {"action": "fold", "debug": dbg}
 
@@ -249,6 +297,26 @@ def _strategy_move(gs):
     if probs is None:
         return _equity_move(gs, c, "no key " + key)
 
+    try:
+        opstats(gs)
+        fold_rate, aggr, faced, acts = oprates()
+    except Exception:
+        fold_rate, aggr, faced, acts = 0.40, 0.25, 0, 0
+
+    # shift the trained probabilities toward what this opponent actually does
+    probs = list(probs)
+    fi, ci, hi = ACTIONS.index("f"), ACTIONS.index("c"), ACTIONS.index("h")
+    if aggr > 0.40:                              # bets loosely: fold less
+        w = min((aggr - 0.40) / 0.25, 1.0) * min(acts, 40) / 40
+        moved = probs[fi] * 0.6 * w
+        probs[fi] -= moved
+        probs[ci] += moved
+    if fold_rate > 0.50 and c["owed"] <= 0:      # folds a lot: bet more when checked to
+        w = min((fold_rate - 0.50) / 0.30, 1.0) * min(faced, 30) / 30
+        moved = probs[ci] * 0.5 * w
+        probs[ci] -= moved
+        probs[hi] += moved
+
     raises = raise_options(c["cur"], c["my_bet"], c["pot"], c["min_to"],
                            c["max_to"], c["hist"].count("r"))
     legal = ["f", "c"] if c["owed"] > 0 else ["c"]
@@ -257,7 +325,14 @@ def _strategy_move(gs):
     if sum(weights) <= 0:
         return _equity_move(gs, c, "no legal mass " + key)
     a = random.choices(legal, weights=weights)[0]
-    dbg = {"key": key, "act": a, "eq": round(c["eq"], 3)}
+
+    # don't fold decent hands to small bets from an aggressive opponent
+    if (a == "f" and c["street"] > 0 and acts >= 20 and aggr > 0.40
+            and c["owed"] / max(c["pot"] - c["owed"], 1) < 0.5 and c["eq"] > 0.40):
+        a = "c"
+
+    dbg = {"key": key, "act": a, "eq": round(c["eq"], 3),
+           "opp": [round(fold_rate, 2), round(aggr, 2), faced, acts]}
 
     if a == "f":
         return {"action": "check" if c["can_check"] else "fold", "debug": dbg}
@@ -266,7 +341,6 @@ def _strategy_move(gs):
     if a == "a":
         return {"action": "all_in", "debug": dbg}
     return {"action": "raise", "amount": int(round(raises[a])), "debug": dbg}
-
 
 def decide(game_state: dict) -> dict:
     if game_state.get("type") == "warmup":
