@@ -105,7 +105,7 @@ def opp_cutoff(gs, aggr):
     cutoff -= 0.20 * (aggr - 0.25)                   # aggressive players bet weaker hands
     return max(0.0, min(cutoff, 0.62))
 
-def monte(game_state, cutoff, aggr=0.25, budget=0.4, target=1500):
+def monte(game_state, cutoff, aggr=0.25, budget=0.5, target=1500):
     if game_state["street"] == "preflop":
         return 0
     hero = [eval7.Card(c) for c in game_state["your_cards"]]
