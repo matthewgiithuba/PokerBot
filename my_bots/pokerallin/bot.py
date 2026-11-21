@@ -1,13 +1,4 @@
-"""Heads-up Hold'em bot.
 
-Plays a strategy trained offline by train.py (MCCFR on an abstracted game) and
-falls back to a simple equity-vs-pot-odds rule whenever the situation is not in
-the table. train.py imports this file, so the abstraction (hand buckets, action
-names, info-set key) lives here and is shared by both.
-
-Abstract actions:  f = fold   c = check/call   h = raise ~half pot
-                   p = raise ~pot   a = all-in
-"""
 
 import json
 import os
