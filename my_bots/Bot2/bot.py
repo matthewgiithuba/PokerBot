@@ -2,6 +2,51 @@ import random
 import eval7
 import time
 
+STATS = {
+    "last_done": -1,     # highest hand_num already counted
+    "faced": 0,          # times I bet/raised and they responded
+    "folds": 0,          # ...and they folded
+    "acts": 0,           # their total actions
+    "raises": 0,         # their raises/all-ins
+}
+
+def opstats(gs):
+    me = gs["your_bot_id"]
+    cur = gs["hand_num"]
+    pending = None
+    for e in gs["match_action_log"]:
+        h = e["hand_num"]
+        if h <= STATS["last_done"] or h >= cur:      # only completed, not-yet-counted hands
+            continue
+        a = e["action"]
+        if a in ("small_blind", "big_blind", "ante", "show"):
+            continue
+        key = (h, e["street"])
+        if e["bot_id"] == me:
+            pending = key if a in ("raise", "all_in") else None
+        else:
+            if pending == key:
+                STATS["faced"] += 1
+                if a == "fold":
+                    STATS["folds"] += 1
+            pending = None
+            STATS["acts"] += 1
+            if a in ("raise", "all_in"):
+                STATS["raises"] += 1
+    STATS["last_done"] = max(STATS["last_done"], cur - 1)
+
+def oprates():
+    fold_rate = (STATS["folds"] + 5 * 0.40) / (STATS["faced"] + 5)
+    aggr = (STATS["raises"] + 5 * 0.25) / (STATS["acts"] + 5)
+    return fold_rate, aggr, STATS["faced"]
+
+def last_opp_action(gs):
+    me = gs["your_bot_id"]
+    for e in reversed(gs["action_log"]):
+        if e["bot_id"] != me and e["action"] not in ("small_blind", "big_blind", "ante", "show"):
+            return e
+    return None
+
 PREFLOP = {
     "AA": 0.852, "AKs": 0.671, "AKo": 0.654, "AQs": 0.662, "AQo": 0.642, "AJs": 0.652,
     "AJo": 0.633, "ATs": 0.645, "ATo": 0.628, "A9s": 0.629, "A9o": 0.607, "A8s": 0.620,
@@ -41,8 +86,18 @@ def preflop_equity(cards):
     if hi == lo:
         return PREFLOP[hi + lo]
     return PREFLOP[hi + lo + ("s" if s1 == s2 else "o")]
+def opp_cutoff(gs, aggr):
+    """Minimum preflop-table strength their hand must have, given how they bet."""
+    owed = gs["amount_owed"]
+    if owed == 0:
+        return 0.0                                   # they haven't bet: any hand
+    size = owed / max(gs["pot"] - owed, 1)           # bet as a fraction of the pot before it
+    cutoff = 0.40 + 0.15 * min(size, 1.5)            # bigger bet = stronger hand
+    cutoff += {"flop": 0.0, "turn": 0.02, "river": 0.04}.get(gs["street"], 0.0)
+    cutoff -= 0.20 * (aggr - 0.25)                   # aggressive players bet weaker hands
+    return max(0.0, min(cutoff, 0.62))
 
-def monte(game_state, budget=0.6):
+def monte(game_state,cutoff, budget=0.4):
     if game_state["street"] == "preflop":
         return 0
     hero = [eval7.Card(c) for c in game_state["your_cards"]]
@@ -50,10 +105,6 @@ def monte(game_state, budget=0.6):
     known = set(game_state["your_cards"] + game_state["community_cards"])
     remaining = [c for c in eval7.Deck().cards if str(c) not in known]
     need = 5 - len(board)
-
-    # the more they're asking you to pay, the better their hand probably is
-    pot, owed = game_state["pot"], game_state["amount_owed"]
-    cutoff = 0.0 if owed == 0 else min(0.40 + 0.15 * owed / max(pot - owed, 1), 0.60)
 
     win = tie = total = 0
     end_time = time.perf_counter() + budget
@@ -71,39 +122,7 @@ def monte(game_state, budget=0.6):
             tie += 1
         total += 1
     return (win + tie / 2) / total if total else 0.5
-'''    
-def monte(game_state):
-    duration = 1.0 # Run for 0.6 seconds
-    end_time = time.perf_counter() + duration
 
-    if game_state["street"] == "preflop":
-        return 0
-
-    mycards = [eval7.Card(c) for c in game_state["your_cards"]]   # e.g. ["As", "Kh", "7d"]
-    known = game_state["your_cards"] + game_state["community_cards"]
-    deck = eval7.Deck()
-
-    deck.cards = [c for c in deck.cards if str(c) not in known]
-
-    board = [eval7.Card(c) for c in game_state["community_cards"]]
-    
-    mine = eval7.evaluate(mycards + board)
-
-    win = lose = tie = total = 0
-    while time.perf_counter() < end_time:
-        deck1 = deck.cards[:] 
-        random.shuffle(deck1)
-        opponent = random.sample(deck1, k=2)
-        theirs = eval7.evaluate(opponent + board)
-        if mine > theirs:
-            win += 1
-        elif mine < theirs:
-            lose += 1
-        else:
-            tie += 1
-        total += 1
-    return win/total if total else 0
-'''
 def raise_to(gs, mult):
     amount = int(gs["min_raise_to"] * mult)
     max_total = gs["your_stack"] + gs["your_bet_this_street"]
@@ -116,94 +135,75 @@ def bet_to(gs, frac):
     if target >= gs["your_stack"] + gs["your_bet_this_street"]:
         return {"action": "all_in"}
     return {"action": "raise", "amount": target}
+
 def decide(game_state: dict) -> dict:
     if game_state.get("type") == "warmup":
         return {"action": "check"}
 
+    fold_rate, aggr, faced = 0.40, 0.25, 0
+    try:
+        opstats(game_state)
+        fold_rate, aggr, faced = oprates()
+    except Exception:
+        pass
+
     can_check = game_state["can_check"]
     pot = game_state["pot"]
     owed = game_state["amount_owed"]
     mychips = game_state["your_stack"]
+    bb = game_state["blinds"]["bb"]
     preflop = game_state["street"] == "preflop"
+    on_button = game_state["seat_to_act"] == game_state["button_seat"]
 
-    equity = preflop_equity(game_state["your_cards"]) if preflop else monte(game_state)
+    evidence = min(faced, 30) / 30
+    exploit = max(0.0, min((fold_rate - 0.40) / 0.30, 1.0)) * evidence
 
-    # how big is the bet we're facing, relative to the pot before it?
+    if preflop:
+        equity = preflop_equity(game_state["your_cards"])
+        # FIX 1: only discount hands that lose value against a raiser (replaces the old `if` line)
+        if game_state["current_bet"] > bb and equity < 0.75:
+            equity -= 0.04 + 0.05 * min(owed / max(pot - owed, 1), 2.0)
+    else:
+        equity = monte(game_state, opp_cutoff(game_state, aggr))
+
     bet_size = owed / max(pot - owed, 1)
 
-    # 1) strong hands: bet for value (don't keep re-raising weak-ish hands into big bets)
+    # FIX 3: short-stack shove-or-fold (needs equity and can_check, so it goes after them)
+    if mychips < 10 * bb and not can_check:
+        return {"action": "all_in"} if equity > 0.52 else {"action": "fold"}
+
+    bluff_freq = (0.20 if on_button else 0.08) + 0.35 * exploit
+    if faced >= 15 and fold_rate < 0.25:
+        bluff_freq = 0.0
+
+    value_thr = 0.62 - 0.05 * exploit
+    open_thr = 0.44 - 0.06 * exploit
+
+    if preflop and on_button and game_state["current_bet"] <= bb and equity > open_thr:
+        return bet_to(game_state, 0.6)
+
     if not preflop and equity > 0.97:
         return {"action": "all_in"}
     if equity > 0.80:
         return bet_to(game_state, 0.75)
-    if equity > 0.62 and bet_size < 0.5:
+    if equity > value_thr and bet_size < 0.5:
         return bet_to(game_state, 0.5)
 
-    # 2) free card
     if can_check:
+        if not preflop and equity < 0.45 and random.random() < bluff_freq:
+            return bet_to(game_state, 0.5)
         return {"action": "check"}
 
-    # 3) facing a bet: call only if equity beats the price, with a margin that grows with the bet
-    pot_odds = owed / (pot + owed)
+    call_amt = min(owed, mychips)
+    pot_odds = call_amt / (pot + call_amt)
     margin = 0.05 + 0.10 * min(bet_size, 1.0)
+    # FIX 2: defend wider against small raises so re-raising your opens doesn't print money
+    if preflop and owed < 3 * bb:
+        margin -= 0.03
     if equity > pot_odds + margin:
         return {"action": "all_in"} if owed >= mychips else {"action": "call"}
     return {"action": "fold"}
-'''
-def decide(game_state: dict) -> dict:
-    if game_state.get("type") == "warmup":     # one call before hand 1; load things here if you like
-        return {"action": "check"}
 
-    # ── Your strategy goes here. This example is deliberately simple. ──────────
-    cards = game_state["your_cards"]
-    pot = game_state["pot"]
-    owed = game_state["amount_owed"]
-    street = game_state["street"]
-    minraise = game_state["min_raise_to"]
-    mychips = game_state["your_stack"]
-    can_check = game_state["can_check"]
-
-    if game_state["street"] == "preflop":
-        equity = preflop_equity(game_state["your_cards"])
-        if equity > 0.81:
-            return raise_to(game_state, 2)
-        elif equity > 0.61:
-            if can_check:
-                return {"action": "check"}
-            elif mychips > owed:
-                return {"action": "call"} 
-            elif owed >= mychips:
-                return {"action": "all_in"}  
-        elif can_check:
-            return {"action": "check"}
-
-    elif game_state["street"] != "preflop":
-        odds = monte(game_state)
-        if odds > 0.97:
-            return {"action": "all_in"}
-        elif odds > 0.8:
-            if minraise*2 < game_state["your_stack"]:
-                araise = minraise*2
-                return {"action": "raise", "amount": araise}
-            elif can_check:
-                if minraise < game_state["your_stack"]:
-                    araise = minraise
-                return {"action": "raise", "amount": araise} 
-            else:
-                return {"action": "all_in"}
-        elif odds > 0.6:
-            if minraise*1.5 < game_state["your_stack"]:
-                araise = minraise*1.5
-                return {"action": "raise", "amount": araise}
-            elif can_check:
-                return {"action": "check"}
-            else:
-                return {"action": "call"}
-        elif odds < 0.6 and odds > 0.55:
-            if can_check:
-                return {"action": "check"}
-    return {"action": "fold"}
-'''
         
 
 
